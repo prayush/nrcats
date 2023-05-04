@@ -7,23 +7,22 @@ class SXSCatalog(catalog.CatalogBase):
     def __init__(self, catalog=None, verbosity=0, **kwargs) -> None:
         super().__init__(catalog, **kwargs)
         self._verbosity = verbosity
+        import time
+        _itime = time.time()
         self._add_paths_to_metadata()
+        print("ADDING TOOK {} SECONDs".format(time.time() - _itime))
 
     def waveform_filename_from_simname(self, sim_name):
         return os.path.basename(self.waveform_filepath_from_simname(sim_name))
 
     def waveform_filepath_from_simname(self, sim_name):
         poss_files = self.select_files(f"{sim_name}/Lev/rhOverM")
-        file_path = (
-            sxs.sxs_directory("cache")
-            / poss_files[list(poss_files.keys())[0]]["truepath"]
-        )
+        file_path = (sxs.sxs_directory("cache") /
+                     poss_files[list(poss_files.keys())[0]]["truepath"])
         if not os.path.exists(file_path):
             if self._verbosity > 2:
-                print(
-                    f"WARNING: Could not resolve path for {sim_name}"
-                    f"..best calculated path = {file_path}"
-                )
+                print(f"WARNING: Could not resolve path for {sim_name}"
+                      f"..best calculated path = {file_path}")
         return file_path.as_posix()
 
     def metadata_filename_from_simname(self, sim_name):
@@ -31,16 +30,12 @@ class SXSCatalog(catalog.CatalogBase):
 
     def metadata_filepath_from_simname(self, sim_name):
         poss_files = self.select_files(f"{sim_name}/Lev/metadata.json")
-        file_path = (
-            sxs.sxs_directory("cache")
-            / poss_files[list(poss_files.keys())[0]]["truepath"]
-        )
+        file_path = (sxs.sxs_directory("cache") /
+                     poss_files[list(poss_files.keys())[0]]["truepath"])
         if not os.path.exists(file_path):
             if self._verbosity > 2:
-                print(
-                    f"WARNING: Could not resolve path for {sim_name}"
-                    f"..best calculated path = {file_path}"
-                )
+                print(f"WARNING: Could not resolve path for {sim_name}"
+                      f"..best calculated path = {file_path}")
         return file_path.as_posix()
 
     def get(self, sim_name, extrapolation_order=2):
@@ -57,26 +52,66 @@ class SXSCatalog(catalog.CatalogBase):
         raise NotImplementedError("This shouldn't be called.")
 
     def _add_paths_to_metadata(self):
+        import time, tqdm
+        _itime = time.time()
         metadata_dict = self._dict["simulations"]
-        existing_cols = list(metadata_dict[list(metadata_dict.keys())[0]].keys())
+        existing_cols = list(metadata_dict[list(
+            metadata_dict.keys())[0]].keys())
         new_cols = [
             "metadata_link",
             "metadata_location",
             "waveform_data_link",
             "waveform_data_location",
         ]
+        _itime2 = time.time()
+        print("STEP 1 {} secs".format(_itime2 - _itime))
 
         if any([col not in existing_cols for col in new_cols]):
-            for sim_name in metadata_dict:
-                if "metadata_location" not in existing_cols:
-                    metadata_dict[sim_name][
-                        "metadata_location"
-                    ] = self.metadata_filepath_from_simname(sim_name)
-                if "metadata_link" not in existing_cols:
-                    metadata_dict[sim_name]["metadata_link"] = ""
-                if "waveform_data_link" not in existing_cols:
-                    metadata_dict[sim_name]["waveform_data_link"] = ""
-                if "waveform_data_location" not in existing_cols:
-                    metadata_dict[sim_name][
-                        "waveform_data_location"
-                    ] = self.waveform_filepath_from_simname(sim_name)
+            for sim_name in tqdm.tqdm(metadata_dict):
+                sim_metadata_dict = metadata_dict[sim_name]
+                if 'metadata_location' not in existing_cols:
+                    sim_metadata_dict[
+                        'metadata_location'] = self.metadata_filepath_from_simname(
+                            sim_name)
+                if 'metadata_link' not in existing_cols:
+                    sim_metadata_dict['metadata_link'] = ""
+                if 'waveform_data_link' not in existing_cols:
+                    sim_metadata_dict['waveform_data_link'] = ""
+                if 'waveform_data_location' not in existing_cols:
+                    sim_metadata_dict[
+                        'waveform_data_location'] = ""  #self.waveform_filepath_from_simname(
+                    # sim_name)
+        _itime3 = time.time()
+        print("STEP 2 {} secs".format(_itime3 - _itime2))
+        self._force_update_downloaded_catalog()
+        _itime4 = time.time()
+        print("STEP 3 {} secs".format(_itime4 - _itime3))
+
+    def _force_update_downloaded_catalog(self, download=None):
+        import json
+        import tempfile
+        import zipfile
+        from sxs import sxs_directory
+
+        cache_path = sxs_directory("cache") / "catalog.zip"
+
+        try:
+            with zipfile.ZipFile(cache_path, "a") as catalog_zip:
+                try:
+                    with catalog_zip.open("catalog.json", "w") as catalog_json:
+                        try:
+                            s = json.dumps(self._dict,
+                                           ensure_ascii=False,
+                                           indent=4).encode('utf-8')
+                            catalog_json.write(s)
+                        except Exception as e:
+                            raise ValueError(
+                                f"Failed to parse 'catalog.json' in '{cache_path}'"
+                            ) from e
+                except Exception as e:
+                    raise ValueError(
+                        f"Failed to open 'catalog.json' in '{cache_path}'"
+                    ) from e
+        except Exception as e:
+            raise ValueError(
+                f"Failed to open '{cache_path}' as a ZIP file") from e
