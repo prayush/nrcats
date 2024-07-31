@@ -456,5 +456,5 @@ class TestGTPol(unittest.TestCase):
 
         message(f"Max mismatch from this set is {max_mm}", message_verbosity=1)
 
-    if __name__ == "__main__":
-        unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=3)
+if __name__ == "__main__":
+    unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=3)

@@ -370,5 +370,5 @@ class TestSXSModes(unittest.TestCase):
                 f"The arrays must equal atleast upto {prec} decimals",
             )
 
-    if __name__ == "__main__":
-        unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=3)
+if __name__ == "__main__":
+    unittest.main(argv=["first-arg-is-ignored"], exit=False, verbosity=3)
