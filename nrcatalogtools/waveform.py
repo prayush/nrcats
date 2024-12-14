@@ -191,6 +191,120 @@ class WaveformModes(sxs_WaveformModes):
             **w_attributes,
         )
 
+    @classmethod
+    def load_from_targz(cls, file_path_or_open_file, metadata={}, verbosity=0):
+        """Method to load SWSH waveform modes from RIT or MAYA catalogs
+        from HDF5 file.
+
+        Args:
+            file_path_or_open_file (str or open file): Either the path to an
+                HDF5 file containing waveform data, or an open file pointer to
+                the same.
+            metadata (dict): Dictionary containing metadata (Note that keys
+                will be NR group specific)
+            verbosity (int, optional): Verbosity level with which to
+                print messages during execution. Defaults to 0.
+
+        Raises:
+            RuntimeError: If inputs are invalid, or if no mode found in
+                input file.
+
+        Returns:
+            WaveformModes: Object containing time-series of SWSH modes.
+        """
+        import quaternionic
+
+        if type(file_path_or_open_file) is h5py._hl.files.File:
+            h5_file = file_path_or_open_file
+            close_input_file = False
+        elif os.path.exists(file_path_or_open_file):
+            h5_file = h5py.File(file_path_or_open_file, "r")
+            close_input_file = True
+        else:
+            raise RuntimeError(f"Could not use or open {file_path_or_open_file}")
+
+        # Set the file path attribute
+        cls._filepath = h5_file.filename
+        # If _metadata is not already
+        # a set attribute, then set
+        # it here.
+
+        try:
+            cls._metadata
+        except AttributeError:
+            cls._metadata = metadata
+
+        ELL_MIN, ELL_MAX = 2, 10
+        ell_min, ell_max = 99, -1
+        LM = []
+        t_min, t_max, dt = -1e99, 1e99, 1
+        mode_data = {}
+        for ell in range(ELL_MIN, ELL_MAX + 1):
+            for em in range(-ell, ell + 1):
+                afmt = f"amp_l{ell}_m{em}"
+                pfmt = f"phase_l{ell}_m{em}"
+                if afmt not in h5_file or pfmt not in h5_file:
+                    continue
+                amp_time = h5_file[afmt]["X"][:]
+                amp = h5_file[afmt]["Y"][:]
+                phase_time = h5_file[pfmt]["X"][:]
+                phase = h5_file[pfmt]["Y"][:]
+                mode_data[(ell, em)] = [amp_time, amp, phase_time, phase]
+                # get the minimum time and maximum time stamps for all modes
+                t_min = max(t_min, amp_time[0], phase_time[0])
+                t_max = min(t_max, amp_time[-1], phase_time[-1])
+                dt = min(
+                    dt,
+                    stat_mode(np.diff(amp_time), keepdims=True)[0][0],
+                    stat_mode(np.diff(phase_time), keepdims=True)[0][0],
+                )
+                ell_min = min(ell_min, ell)
+                ell_max = max(ell_max, ell)
+                LM.append([ell, em])
+        if close_input_file:
+            h5_file.close()
+        if len(LM) == 0:
+            raise RuntimeError(
+                "We did not find even one mode in the file. Perhaps the "
+                "format `amp_l?_m?` and `phase_l?_m?` is not the "
+                "nomenclature of datagroups in the input file?"
+            )
+
+        times = np.arange(t_min, t_max + 0.5 * dt, dt)
+        data = np.empty((len(times), len(LM)), dtype=complex)
+        for idx, (ell, em) in enumerate(LM):
+            amp_time, amp, phase_time, phase = mode_data[(ell, em)]
+            amp_interp = InterpolatedUnivariateSpline(amp_time, amp)
+            phase_interp = InterpolatedUnivariateSpline(phase_time, phase)
+            data[:, idx] = amp_interp(times) * np.exp(1j * phase_interp(times))
+
+        w_attributes = {}
+        w_attributes["metadata"] = metadata
+        w_attributes["history"] = ""
+        w_attributes["frame"] = quaternionic.array([[1.0, 0.0, 0.0, 0.0]])
+        w_attributes["frame_type"] = "inertial"
+        w_attributes["data_type"] = h
+        w_attributes["spin_weight"] = translate_data_type_to_spin_weight(
+            w_attributes["data_type"]
+        )
+        w_attributes["data_type"] = translate_data_type_to_sxs_string(
+            w_attributes["data_type"]
+        )
+        w_attributes["r_is_scaled_out"] = True
+        w_attributes["m_is_scaled_out"] = True
+        # w_attributes["ells"] = ell_min, ell_max
+
+        return cls(
+            data,
+            time=times,
+            time_axis=0,
+            modes_axis=1,
+            ell_min=ell_min,
+            ell_max=ell_max,
+            verbosity=verbosity,
+            **w_attributes,
+        )
+
     @property
     def filepath(self):
         """Return the data file path"""
