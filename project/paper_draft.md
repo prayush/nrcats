@@ -325,6 +325,9 @@ The phase difference per cycle remains tightly constrained to $< 0.05$ rad/cycle
 
 ![Figure 4: Mismatch heatmap in the (q, chi_eff) parameter space for the dominant (2,2) mode across SXS, RIT, and MAYA.](figs/fig4_mismatch22_heatmap_qc.png)
 
+In Figure 4, we observe that the mismatch $(1-\mathcal{F}_{22})$ increases systematically in regions of high mass ratio and non-zero effective spin. For the SXS catalog, the highest mean mismatches ($\approx 0.14$) are localized in the $q \in (3.5, 4.0], \chi_{\rm eff} \in (0.25, 0.5]$ and $q \in (1.5, 2.0], \chi_{\rm eff} \in (-0.25, 0.0]$ regions. The RIT catalog exhibits even larger discrepancies ($\approx 0.43 - 0.53$) in overlapping regions, particularly near $q \in (2.0, 2.5]$ and $q \in (3.5, 4.0]$. The shared degradation at the $q \approx 4$ boundary indicates that the surrogate's interpolation accuracy decreases significantly near the edge of its training domain, while the isolated RIT hotspots at lower $q$ suggest code-specific systematic numerical differences.
+
+
 
 ---
 

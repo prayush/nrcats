@@ -48,6 +48,7 @@ from nrcatalogtools.surrogate import (
     SURROGATE_MODES,
     load_nrsur7dq4,
 )
+from nrcatalogtools.lalsim_interface import generate_lalsim_modes
 from nrcatalogtools.waveform.matching import (
     compute_mode_match,
     compute_phase_diff_per_cycle,
@@ -223,7 +224,13 @@ def _init_worker():
     load_nrsur7dq4()
 
 
-def _run_one_sim(job: dict, delta_t: float, psd_name: str, distance: float) -> dict:
+def _run_one_sim(
+    job: dict,
+    delta_t: float,
+    psd_name: str,
+    distance: float,
+    model_name: str = "NRSur7dq4",
+) -> dict:
     """Run the full NR vs NRSur7dq4 comparison for one simulation.
 
     ``job`` is a metadata dict as produced by ``collect_metadata()``.
@@ -267,19 +274,44 @@ def _run_one_sim(job: dict, delta_t: float, psd_name: str, distance: float) -> d
             _worker_cat_cache[catname] = load_catalog(catname)
         cat = _worker_cat_cache[catname]
 
-        # Generate surrogate modes
-        h_sur, f_lower_sur = generate_surrogate_modes(
-            params,
-            total_mass=job["total_mass"],
-            distance=distance,
-            delta_t_seconds=delta_t,
-        )
+        # Fetch NR waveform
+        wfm = cat.get(sim_id)
+
+        # Generate reference modes
+        if model_name == "NRSur7dq4":
+            h_sur, f_lower_sur = generate_surrogate_modes(
+                params,
+                total_mass=job["total_mass"],
+                distance=distance,
+                delta_t_seconds=delta_t,
+            )
+        else:
+            try:
+                nr22 = wfm.get_mode(
+                    2,
+                    2,
+                    total_mass=job["total_mass"],
+                    distance=distance,
+                    delta_t_seconds=delta_t,
+                )
+                t_start = float(nr22.sample_times[0])
+                t_end = float(nr22.sample_times[-1])
+                time_bounds = (t_start, t_end)
+            except Exception:
+                time_bounds = None
+
+            h_sur, f_lower_sur = generate_lalsim_modes(
+                params,
+                total_mass=job["total_mass"],
+                distance=distance,
+                delta_t_seconds=delta_t,
+                approximant=model_name,
+                time_bounds=time_bounds,
+            )
+
         row["f_lower_sur"] = f_lower_sur
         f_lower_match = max(job["f_lower_nr"], f_lower_sur)
         row["f_lower_match"] = f_lower_match
-
-        # Fetch NR waveform
-        wfm = cat.get(sim_id)
 
         # Per-mode matches
         for (ell, em) in SURROGATE_MODES:
@@ -349,6 +381,7 @@ def _run_one_sim_top(job: dict) -> dict:
         delta_t=job.get("_delta_t", DELTA_T),
         psd_name=job.get("_psd_name", "aLIGOZeroDetHighPower"),
         distance=job.get("_distance", DISTANCE),
+        model_name=job.get("_model_name", "NRSur7dq4"),
     )
 
 
@@ -442,6 +475,7 @@ def run_batch(
     psd_name: str = "aLIGOZeroDetHighPower",
     outdir: str = "results",
     dry_run: bool = False,
+    model_name: str = "NRSur7dq4",
 ):
     os.makedirs(outdir, exist_ok=True)
     merged_csv = os.path.join(outdir, "batch_aligned_all.csv")
@@ -492,6 +526,7 @@ def run_batch(
         j["_psd_name"] = psd_name
         j["_distance"] = DISTANCE
         j["_indiv_dir"] = _indiv_dir
+        j["_model_name"] = model_name
 
     # ── processing loop ───────────────────────────────────────────────────────
     t0 = time.time()
@@ -617,6 +652,11 @@ def _build_parser():
         action="store_true",
         help="Only print sim counts, do not run comparisons",
     )
+    p.add_argument(
+        "--model",
+        default="NRSur7dq4",
+        help="Reference model name (NRSur7dq4, SEOBNRv4PHM, etc)",
+    )
     return p
 
 
@@ -630,4 +670,5 @@ if __name__ == "__main__":
         psd_name=args.psd,
         outdir=args.outdir,
         dry_run=args.dry_run,
+        model_name=args.model,
     )
