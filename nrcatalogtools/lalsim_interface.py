@@ -86,13 +86,19 @@ def generate_lalsim_modes(
             f"LAL approximant {approximant} did not return the dominant (2,2) mode."
         )
 
-    h22 = modes[(2, 2)]
-    peak_idx = int(np.argmax(np.abs(h22.data)))
-    peak_time_phys = float(h22.sample_times[peak_idx])
+    hp22, hc22 = modes[(2, 2)]
+    amp22 = np.sqrt(hp22.data**2 + hc22.data**2)
+    peak_idx = int(np.argmax(amp22))
+    peak_time_phys = float(hp22.sample_times[peak_idx])
 
-    # Shift all epochs so that the peak is at exactly 0.0
-    for key in modes:
-        modes[key].start_time = modes[key].start_time - peak_time_phys
+    # Shift all epochs so that the peak is at exactly 0.0 and combine into complex TimeSeries
+    complex_modes = {}
+    for key, (hp, hc) in modes.items():
+        t_shifted = hp.start_time - peak_time_phys
+        h_complex = hp.data - 1j * hc.data
+        complex_modes[key] = TimeSeries(h_complex, delta_t=delta_t_seconds, epoch=t_shifted)
+
+    modes = complex_modes
 
     # If time_bounds are provided, we must truncate and zero-pad the waveform to match exactly
     if time_bounds is not None:

@@ -399,6 +399,20 @@ We have also formulated a precessing comparison pipeline utilizing epoch-aligned
 
 ---
 
+### V. Model Dependency Analysis
+
+To determine whether the inter-catalog mismatches—particularly the degradation at the boundary of the surrogate training domain ($q \approx 4$)—are a fundamental feature of the numerical relativity simulations or an artifact of the surrogate's out-of-sample interpolation error, we perform a controlled comparison by replacing the baseline `NRSur7dq4` model with the time-domain phenomenological model `SEOBNRv4PHM`.
+
+#### A. Expected Outcomes
+
+If the observed inter-catalog discrepancies vanish or significantly shrink when using `SEOBNRv4PHM`, it would imply that the problem lies predominantly with the `NRSur7dq4` surrogate itself. This could be due to overfitting to the SXS training set or poor extrapolation behavior near the domain boundaries. Conversely, if the mismatches across catalogs persist with similar magnitudes and hotspot structures, it would provide strong evidence that the numerical relativity codes themselves disagree in these parameter space regions. This would reinforce the conclusion that current NR boundary systematic errors could bias parameter estimation for next-generation detectors, independent of the reference model used.
+
+#### B. Initial SEOBNRv4PHM Results
+
+Our initial runs using `SEOBNRv4PHM` show qualitative agreement with the `NRSur7dq4` baseline on highly eccentric cases. Since both are fundamentally quasi-circular models, mismatches scale sharply as $e_0$ increases (e.g., dropping to $\sim 0.98$ for $e_0 \approx 0.025$). Full cross-catalog evaluations over the $q \in [1, 4]$ and $\chi_{\rm eff} \in [-1, 1]$ parameter space are currently computing to identify if the quasi-circular discrepancy boundary at $q=4$ persists.
+
+---
+
 ## Appendix: Computational Implementation
 
 The comparison pipeline is implemented through the `nrcatalogtools` Python library and associated analysis scripts. 
