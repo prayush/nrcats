@@ -96,7 +96,9 @@ def generate_lalsim_modes(
     for key, (hp, hc) in modes.items():
         t_shifted = hp.start_time - peak_time_phys
         h_complex = hp.data - 1j * hc.data
-        complex_modes[key] = TimeSeries(h_complex, delta_t=delta_t_seconds, epoch=t_shifted)
+        complex_modes[key] = TimeSeries(
+            h_complex, delta_t=delta_t_seconds, epoch=t_shifted
+        )
 
     modes = complex_modes
 
