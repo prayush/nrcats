@@ -620,37 +620,90 @@ def compute_mode_match(
     ).match
 
 
-def compute_phase_diff_per_cycle(h_nr, h_sur, alignment: str = "peak") -> tuple:
-    """Compute accumulated phase difference per GW cycle over the common window.
+# Cycles the window must carry before the per-cycle phase metric means anything.
+# The metric divides by the cycle count, so a short window turns a small phase
+# difference into a large rate; below a few cycles the quantity is a ratio of two
+# poorly-determined numbers rather than a drift.  See the docstring of
+# compute_phase_diff_per_cycle for the measurement that set this.
+MIN_CYCLES_FOR_PHASE = 3.0
 
-    Both inputs are the *complex* mode time series (h_lm = h+ - i h×).
-    The two waveforms are trimmed to their shared time window (both should have
-    epoch set so t=0 is at peak amplitude), then the total accumulated phase of
-    each is computed from the unwrapped angle.
+# How monotone the NR phase must be before a "net accumulated phase" means
+# anything: the net advance divided by the total variation, which is 1 for a
+# clean chirp.  Set from measurement rather than taste -- see
+# compute_phase_diff_per_cycle.
+MIN_PHASE_MONOTONICITY = 0.9
 
-    The metric returned is::
+
+def compute_phase_diff_per_cycle(
+    h_nr,
+    h_sur,
+    alignment: str = "epoch",
+    min_cycles: float = MIN_CYCLES_FOR_PHASE,
+) -> tuple:
+    """Accumulated phase difference per GW cycle over the common window.
+
+    Both inputs are the *complex* mode time series (h_lm = h+ - i h×), and both
+    must be referenced to a common ``t = 0`` -- the (2,2) amplitude peak for
+    every mode, which is what ``WaveformModes.get_mode()`` and the surrogate
+    generator set.  The metric returned is::
 
         phase_diff_per_cycle = |ΔΦ_NR - ΔΦ_sur| / N_cycles_NR   [rad / cycle]
 
-    where ``ΔΦ = |φ(t_end) - φ(t_start)|`` is the total phase evolved and
-    ``N_cycles_NR = ΔΦ_NR / (2π)``.
+    with ``ΔΦ = |φ(t_end) - φ(t_start)|`` the net phase evolved over the window.
+    The numerator is ``δφ(t_end) - δφ(t_start)``, the change in the phase
+    difference across the window, so a constant offset -- a coalescence-phase
+    convention -- cancels.  It is NOT the phase residual after match()-optimal
+    time alignment.
+
+    What this function got wrong until 2026-09-18
+    ---------------------------------------------
+    Note first that, since ``N_cycles_NR = ΔΦ_NR / 2π``, the metric is
+    identically ``2π |1 - ΔΦ_sur/ΔΦ_NR|``: 2π times the *fractional* difference
+    in accumulated phase, unbounded above, and divergent as the denominator
+    goes to zero.  Two things then made the denominator wrong:
+
+    1. ``N_cycles`` was taken from the *net* endpoint difference, which counts
+       cycles only while the phase is monotone.  On ``RIT:eBBH:1132-n100-ecc``
+       -- a single close encounter -- the net difference is 3.14 rad against a
+       total variation of 96.9 rad, so ``N_cycles`` came out at 0.50, passing
+       the old 0.5-cycle floor by a hair, and the metric reported 288 rad/cycle
+       for an accumulated-phase ratio of 46.9.  The cycle count now comes from
+       the total variation, which agrees with the net difference exactly for a
+       monotone chirp (``SXS:BBH:2348``: 275.13 rad both ways) and differs by a
+       factor of 30 where the phase wanders.
+    2. The window was cut around each mode's *own* amplitude peak, found by
+       :func:`_get_merger_index`, which takes the last prominent peak in order
+       to step over junk radiation.  On a burst-like waveform the last
+       prominent peak is late-time structure: for the same simulation it landed
+       at t = +0.2373 s where the epoch puts the peak at 0.  The window is now
+       the intersection of the two series *in time*, which is mode-independent
+       and needs no peak search.
+
+    ``alignment='peak'`` preserves the superseded behaviour, because
+    ``compare_alignment_backends.py`` exists to compare these conventions and
+    because it is what produced the phase columns of the frozen 2026-08 results.
 
     Parameters
     ----------
-    h_nr : pycbc.types.TimeSeries
-        Complex NR mode time series.
-    h_sur : pycbc.types.TimeSeries
-        Complex surrogate mode time series.
+    h_nr, h_sur : pycbc.types.TimeSeries
+        Complex NR and model mode time series, same ``delta_t``, both
+        referenced to a common ``t = 0``.
     alignment : str, optional
-        Method to align waveforms before computing phase diff. 'peak' (default)
-        or 'crosscorr'.
+        ``'epoch'`` (default) cuts the window from the epochs; ``'peak'`` from
+        each series' own amplitude peak; ``'crosscorr'`` from the cross-
+        correlation lag.
+    min_cycles : float, optional
+        Refuse to report a value below this many cycles in the window
+        (default :data:`MIN_CYCLES_FOR_PHASE`).  Pass ``0`` to disable.
 
     Returns
     -------
     tuple[float, float]
-        ``(phase_diff_per_cycle, n_cycles_nr)``.
-        Returns ``(nan, nan)`` if either waveform has zero norm or the common
-        window contains fewer than 2 samples.
+        ``(phase_diff_per_cycle, n_cycles_nr)``.  The value is ``nan`` when
+        either waveform has zero norm, when the window holds fewer than two
+        samples, or when it carries fewer than ``min_cycles`` cycles -- and in
+        that last case ``n_cycles_nr`` is still returned, so the reason for the
+        refusal is visible in the output rather than being another bare NaN.
     """
     # np.asarray for the reason given in compute_mode_match: np.array() on a
     # pycbc TimeSeries triggers the numpy-2 __array__ copy-keyword warning.
@@ -660,7 +713,19 @@ def compute_phase_diff_per_cycle(h_nr, h_sur, alignment: str = "peak") -> tuple:
     if float(np.max(np.abs(arr_nr))) < 1e-50 or float(np.max(np.abs(arr_sur))) < 1e-50:
         return float("nan"), float("nan")
 
-    if alignment == "peak":
+    if alignment == "epoch":
+        dt = float(h_nr.delta_t)
+        t_start = max(float(h_nr.start_time), float(h_sur.start_time))
+        t_end = min(float(h_nr.end_time), float(h_sur.end_time))
+        if t_end <= t_start:
+            return float("nan"), float("nan")
+        start_nr = max(0, int(round((t_start - float(h_nr.start_time)) / dt)))
+        start_sur = max(0, int(round((t_start - float(h_sur.start_time)) / dt)))
+        n_nr = min(len(arr_nr) - start_nr, int(round((t_end - t_start) / dt)) + 1)
+        n_sur = min(len(arr_sur) - start_sur, int(round((t_end - t_start) / dt)) + 1)
+        end_nr = start_nr + min(n_nr, n_sur)
+
+    elif alignment == "peak":
         idx_peak_nr = _get_merger_index(arr_nr)
         idx_peak_sur = _get_merger_index(arr_sur)
 
@@ -684,27 +749,32 @@ def compute_phase_diff_per_cycle(h_nr, h_sur, alignment: str = "peak") -> tuple:
     if n < 2:
         return float("nan"), float("nan")
 
-    i_nr_s = start_nr
-    i_sur_s = start_sur
-
-    phi_nr = np.unwrap(np.angle(arr_nr[i_nr_s : i_nr_s + n]))
-    phi_sur = np.unwrap(np.angle(arr_sur[i_sur_s : i_sur_s + n]))
+    phi_nr = np.unwrap(np.angle(arr_nr[start_nr : start_nr + n]))
+    phi_sur = np.unwrap(np.angle(arr_sur[start_sur : start_sur + n]))
 
     delta_phi_nr = abs(phi_nr[-1] - phi_nr[0])
     delta_phi_sur = abs(phi_sur[-1] - phi_sur[0])
 
-    n_cycles_nr = delta_phi_nr / (2.0 * np.pi)
-    if n_cycles_nr < 0.5:
-        return float("nan"), float("nan")
+    # Cycles actually traversed, not the net phase change: the two agree for a
+    # monotone chirp and differ by a factor of 30 where the phase wanders.
+    traversed = float(np.abs(np.diff(phi_nr)).sum())
+    n_cycles_nr = traversed / (2.0 * np.pi)
+    if n_cycles_nr < min_cycles:
+        return float("nan"), n_cycles_nr
 
-    # |ΔΦ_NR − ΔΦ_sur| measures the difference in total accumulated phase
-    # (i.e. cycle-count error) over the common window.  Taking differences
-    # within each waveform removes any constant initial-phase offset, so the
-    # result is independent of coalescence-phase convention.  It is NOT the
-    # same as the phase residual after match()-optimal time alignment; it uses
-    # the absolute time alignment (both waveforms referenced to t=0 at peak).
+    # A net phase advance is only "accumulated phase" while the phase advances.
+    # The numerator compares net advances, so where the NR phase wanders the
+    # comparison is between two quantities that do not mean the same thing, and
+    # the honest answer is a refusal.  Measured on the (2,2) mode at 16384 Hz:
+    # SXS:BBH:2348 1.000, GT0357 0.988, MAYA1022 0.975 -- clean chirps, all
+    # reported; GT0420 0.647 and RIT:eBBH:1132-n100-ecc 0.032 -- the two
+    # populations that produced the values findings 5y is about, both refused.
+    monotonicity = delta_phi_nr / traversed if traversed > 0 else 0.0
+    if monotonicity < MIN_PHASE_MONOTONICITY:
+        return float("nan"), n_cycles_nr
+
     phase_diff_per_cycle = abs(delta_phi_nr - delta_phi_sur) / n_cycles_nr
-    return float(phase_diff_per_cycle), float(n_cycles_nr)
+    return float(phase_diff_per_cycle), n_cycles_nr
 
 
 def mode_f_lower(f_lower: float, em: int) -> float:

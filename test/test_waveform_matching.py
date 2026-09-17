@@ -7,6 +7,8 @@ import pytest
 from pycbc.types import FrequencySeries, TimeSeries
 
 from nrcats.waveform.matching import (
+    MIN_CYCLES_FOR_PHASE,
+    MIN_PHASE_MONOTONICITY,
     compute_mode_match,
     compute_phase_diff_per_cycle,
     load_psd,
@@ -169,24 +171,77 @@ def test_phase_diff_zero_norm_second_arg():
     assert np.isnan(diff) and np.isnan(n_cyc)
 
 
-def test_phase_diff_ignores_the_epoch():
-    """Same epoch-independence for the phase metric -- see the match test above."""
+def test_phase_diff_respects_the_epoch():
+    """The epoch is the reference, and two series that do not overlap refuse.
+
+    This inverts an earlier test which asserted epoch-*independence*.  That
+    contract is what forced the function to find its own amplitude peak in each
+    mode, and on a burst-like waveform the peak finder takes the last prominent
+    peak -- landing 0.24 s away from where the epoch puts it, and cutting the
+    window around the wrong instant (findings 5y).  Both callers in this package
+    reference every mode to the (2,2) peak, so the epoch carries the alignment
+    and the metric should use it.
+    """
     h1 = _complex_ts(epoch=0.0)
-    h2 = _complex_ts(epoch=3.0)
+    h2 = _complex_ts(epoch=3.0)  # begins after h1 ends
     diff, n_cyc = compute_phase_diff_per_cycle(h1, h2)
-    assert not np.isnan(diff) and not np.isnan(n_cyc)
+    assert np.isnan(diff)
+
+    # A partial overlap is measured, over the overlap alone.
+    h3 = _complex_ts(epoch=_DURATION / 2)
+    diff_overlap, n_overlap = compute_phase_diff_per_cycle(h1, h3)
+    assert not np.isnan(diff_overlap)
+    _, n_full = compute_phase_diff_per_cycle(h1, h1.copy())
+    assert n_overlap < n_full
 
 
-def test_phase_diff_too_few_cycles_returns_nan():
-    """Waveform with < 0.5 accumulated GW cycles should return (nan, nan)."""
-    # 20 samples at 4096 Hz ≈ 4.9 ms; at 50 Hz → ~0.24 cycles < 0.5
-    n_short = 20
+def test_phase_diff_too_few_cycles_refuses_but_says_why():
+    """A short window returns nan for the value and keeps the cycle count.
+
+    The metric divides by the cycle count, so a short window turns a small
+    phase difference into a large rate.  The refusal now reports the count that
+    caused it: a bare NaN cannot be audited, and the old 0.5-cycle floor was low
+    enough that the eccentric single-encounter runs passed it and were reported
+    at hundreds of rad/cycle (findings 5y).
+    """
+    n_short = 20  # ~4.9 ms at 4096 Hz, ~0.24 cycles at 50 Hz
     h_short = TimeSeries(
         np.exp(2j * np.pi * _F0 * np.arange(n_short) * _DELTA_T).astype(np.complex128),
         delta_t=_DELTA_T,
     )
     diff, n_cyc = compute_phase_diff_per_cycle(h_short, h_short.copy())
-    assert np.isnan(diff) and np.isnan(n_cyc)
+    assert np.isnan(diff)
+    assert not np.isnan(n_cyc) and n_cyc < MIN_CYCLES_FOR_PHASE
+
+
+def test_cycle_count_is_the_cycles_traversed_not_the_net_phase():
+    """For a monotone chirp the two definitions agree; for a wandering phase
+    they must not, and the wandering case must be refused rather than reported.
+
+    This is the defect of findings 5y in miniature.  The old code counted cycles
+    as |phi(end) - phi(start)| / 2pi, which for a phase that goes up and comes
+    back counts almost nothing, so the division blew up: on
+    RIT:eBBH:1132-n100-ecc the net difference was 3.14 rad against a total
+    variation of 96.9 rad, giving 0.50 "cycles" and 288 rad/cycle.
+    """
+    # Monotone: net and traversed agree, so the fix changes nothing here.
+    h = _complex_ts(freq=_F0)
+    _, n_monotone = compute_phase_diff_per_cycle(h, h.copy())
+    assert abs(n_monotone - _F0 * _DURATION) < 1.0
+
+    # Wandering: the phase advances and returns, so the net change is ~0 while
+    # several cycles are traversed.  The old definition would report ~0 cycles.
+    t = np.arange(_N) * _DELTA_T
+    phase = 8.0 * np.pi * np.sin(2.0 * np.pi * t / (_N * _DELTA_T))
+    wobble = TimeSeries(np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T)
+    net_cycles = abs(phase[-1] - phase[0]) / (2.0 * np.pi)
+    assert net_cycles < 0.5, "construction should have almost no net phase change"
+
+    diff, n_cyc = compute_phase_diff_per_cycle(wobble, h.copy())
+    assert n_cyc > 2.0, "cycles traversed must not be the net phase change"
+    # Whatever it reports, it cannot be the old code's division by ~0 cycles.
+    if not np.isnan(diff):
+        assert diff < 100.0
 
 
 def test_phase_diff_known_phase_offset():
@@ -201,3 +256,31 @@ def test_phase_diff_known_phase_offset():
 
     diff, _ = compute_phase_diff_per_cycle(h_nr, h_sur)
     assert abs(diff) < 1e-6
+
+
+def test_phase_diff_refuses_a_wandering_phase():
+    """A phase that advances and returns has no "accumulated phase" to compare.
+
+    The numerator compares net advances, so where the NR phase wanders the two
+    sides do not mean the same thing.  Measured on real (2,2) modes at
+    16384 Hz, net over total variation: SXS:BBH:2348 1.000, MAYA1022 0.975 --
+    reported; GT0420 0.647 and RIT:eBBH:1132-n100-ecc 0.032 -- the two
+    populations behind findings 5y, refused.
+    """
+    t = np.arange(_N) * _DELTA_T
+    # A chirp with a large oscillation on top: many cycles traversed, but the
+    # phase turns around repeatedly.
+    phase = 2.0 * np.pi * _F0 * t + 30.0 * np.sin(2.0 * np.pi * 5.0 * t)
+    wander = TimeSeries(np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T)
+    traversed = np.abs(np.diff(np.unwrap(np.angle(np.asarray(wander))))).sum()
+    monotonicity = abs(phase[-1] - phase[0]) / traversed
+    assert monotonicity < MIN_PHASE_MONOTONICITY, "construction must wander"
+
+    diff, n_cyc = compute_phase_diff_per_cycle(wander, _complex_ts(freq=_F0))
+    assert np.isnan(diff), "a wandering phase must be refused, not reported"
+    assert n_cyc > MIN_CYCLES_FOR_PHASE, "and the refusal must not be about length"
+
+    # The clean chirp it was built from is still reported.
+    clean = _complex_ts(freq=_F0)
+    ok, _ = compute_phase_diff_per_cycle(clean, clean.copy())
+    assert not np.isnan(ok)
