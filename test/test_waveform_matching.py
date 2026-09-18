@@ -9,6 +9,7 @@ from pycbc.types import FrequencySeries, TimeSeries
 from nrcats.waveform.matching import (
     MIN_CYCLES_FOR_PHASE,
     MIN_PHASE_MONOTONICITY,
+    PHASE_AMP_FLOOR,
     compute_mode_match,
     compute_phase_diff_per_cycle,
     load_psd,
@@ -30,8 +31,12 @@ def _real_ts(freq=_F0, epoch=0.0):
     return TimeSeries(data, delta_t=_DELTA_T, epoch=epoch)
 
 
-def _complex_ts(freq=_F0, epoch=0.0):
-    """Complex exponential TimeSeries (constant amplitude, linear phase)."""
+def _complex_ts(freq=_F0, epoch=-_DURATION):
+    """Complex exponential TimeSeries (constant amplitude, linear phase).
+
+    It ends at t = 0, where a real mode has its (2,2) peak, because the phase
+    metric reads the inspiral: the window stops there.
+    """
     data = np.exp(2j * np.pi * freq * _T).astype(np.complex128)
     return TimeSeries(data, delta_t=_DELTA_T, epoch=epoch)
 
@@ -182,13 +187,13 @@ def test_phase_diff_respects_the_epoch():
     reference every mode to the (2,2) peak, so the epoch carries the alignment
     and the metric should use it.
     """
-    h1 = _complex_ts(epoch=0.0)
-    h2 = _complex_ts(epoch=3.0)  # begins after h1 ends
+    h1 = _complex_ts()  # t in [-2, 0)
+    h2 = _complex_ts(epoch=-3.0 * _DURATION)  # ends before h1 begins
     diff, n_cyc = compute_phase_diff_per_cycle(h1, h2)
     assert np.isnan(diff)
 
     # A partial overlap is measured, over the overlap alone.
-    h3 = _complex_ts(epoch=_DURATION / 2)
+    h3 = _complex_ts(epoch=-_DURATION / 2)
     diff_overlap, n_overlap = compute_phase_diff_per_cycle(h1, h3)
     assert not np.isnan(diff_overlap)
     _, n_full = compute_phase_diff_per_cycle(h1, h1.copy())
@@ -208,6 +213,7 @@ def test_phase_diff_too_few_cycles_refuses_but_says_why():
     h_short = TimeSeries(
         np.exp(2j * np.pi * _F0 * np.arange(n_short) * _DELTA_T).astype(np.complex128),
         delta_t=_DELTA_T,
+        epoch=-n_short * _DELTA_T,
     )
     diff, n_cyc = compute_phase_diff_per_cycle(h_short, h_short.copy())
     assert np.isnan(diff)
@@ -233,7 +239,9 @@ def test_cycle_count_is_the_cycles_traversed_not_the_net_phase():
     # several cycles are traversed.  The old definition would report ~0 cycles.
     t = np.arange(_N) * _DELTA_T
     phase = 8.0 * np.pi * np.sin(2.0 * np.pi * t / (_N * _DELTA_T))
-    wobble = TimeSeries(np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T)
+    wobble = TimeSeries(
+        np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T, epoch=-_DURATION
+    )
     net_cycles = abs(phase[-1] - phase[0]) / (2.0 * np.pi)
     assert net_cycles < 0.5, "construction should have almost no net phase change"
 
@@ -252,7 +260,7 @@ def test_phase_diff_known_phase_offset():
     # shift by a constant phase — the *rate* of phase evolution is unchanged
     phase_offset = np.pi / 4
     data_sur = np.exp(2j * np.pi * _F0 * _T + 1j * phase_offset).astype(np.complex128)
-    h_sur = TimeSeries(data_sur, delta_t=_DELTA_T, epoch=0.0)
+    h_sur = TimeSeries(data_sur, delta_t=_DELTA_T, epoch=-_DURATION)
 
     diff, _ = compute_phase_diff_per_cycle(h_nr, h_sur)
     assert abs(diff) < 1e-6
@@ -262,16 +270,17 @@ def test_phase_diff_refuses_a_wandering_phase():
     """A phase that advances and returns has no "accumulated phase" to compare.
 
     The numerator compares net advances, so where the NR phase wanders the two
-    sides do not mean the same thing.  Measured on real (2,2) modes at
-    16384 Hz, net over total variation: SXS:BBH:2348 1.000, MAYA1022 0.975 --
-    reported; GT0420 0.647 and RIT:eBBH:1132-n100-ecc 0.032 -- the two
-    populations behind findings 5y, refused.
+    sides do not mean the same thing.  On real (2,2) modes the wandering
+    turned out to be post-merger noise, which the window no longer reaches
+    (every case measured reads 1.000 up to the peak), so this is a backstop.
     """
     t = np.arange(_N) * _DELTA_T
     # A chirp with a large oscillation on top: many cycles traversed, but the
     # phase turns around repeatedly.
     phase = 2.0 * np.pi * _F0 * t + 30.0 * np.sin(2.0 * np.pi * 5.0 * t)
-    wander = TimeSeries(np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T)
+    wander = TimeSeries(
+        np.exp(1j * phase).astype(np.complex128), delta_t=_DELTA_T, epoch=-_DURATION
+    )
     traversed = np.abs(np.diff(np.unwrap(np.angle(np.asarray(wander))))).sum()
     monotonicity = abs(phase[-1] - phase[0]) / traversed
     assert monotonicity < MIN_PHASE_MONOTONICITY, "construction must wander"
@@ -284,3 +293,58 @@ def test_phase_diff_refuses_a_wandering_phase():
     clean = _complex_ts(freq=_F0)
     ok, _ = compute_phase_diff_per_cycle(clean, clean.copy())
     assert not np.isnan(ok)
+
+
+def test_phase_diff_ignores_samples_that_carry_no_signal():
+    """Zero-padding and a noise tail must not decide the answer.
+
+    Found by verifying the first version of this fix: it refused 11 clean
+    quasi-circular RIT waveforms (match ~1, ~31 cycles) as non-monotone.  Their
+    windows admitted leading samples at 1e-26 of the peak and a post-merger
+    tail at 1e-13, and the angle of a zero-amplitude sample wanders -- so
+    RIT:eBBH:1133-n100-ecc, a 35-cycle chirp, read as 0.73 monotone.  The
+    phase is now read only where both series exceed PHASE_AMP_FLOOR of their
+    own peak.
+    """
+    rng = np.random.default_rng(20260918)
+    clean = _complex_ts(freq=_F0)
+    ref, ref_n = compute_phase_diff_per_cycle(clean, clean.copy())
+    assert not np.isnan(ref)
+
+    data = np.asarray(clean).copy()
+    pad = _N // 5
+    data[:pad] = 1e-26 * (rng.normal(size=pad) + 1j * rng.normal(size=pad))
+    data[-pad:] = 1e-13 * (rng.normal(size=pad) + 1j * rng.normal(size=pad))
+    dirty = TimeSeries(data, delta_t=_DELTA_T, epoch=-_DURATION)
+
+    diff, n_cyc = compute_phase_diff_per_cycle(dirty, clean.copy())
+    assert not np.isnan(diff), "a clean chirp in padding must be reported"
+    # it is measured over the live span only, so it carries fewer cycles
+    assert n_cyc < ref_n
+    assert n_cyc > 0.5 * ref_n
+    assert PHASE_AMP_FLOOR > 1e-13, "the floor must sit above the noise it trims"
+
+
+def test_phase_diff_stops_at_the_peak():
+    """What happens after t = 0 must not enter an inspiral phase drift.
+
+    Until 2026-09-18 the window ran to the end of the common span, so the
+    numerator carried the ringdown while the denominator counted inspiral
+    cycles: 98% of the (2,2) phase difference for SXS:BBH:2348 accrued after
+    the peak, and the metric read 0.019 rad/cycle against 0.0004 up to it.
+    Here the two series agree exactly before t = 0 and part company after it.
+    """
+    n_post = _N // 4
+    t = (np.arange(_N + n_post) - _N) * _DELTA_T  # the peak is sample _N, at t = 0
+    phase_nr = 2 * np.pi * _F0 * t
+    phase_sur = np.where(t > 0, 2 * np.pi * _F0 * t * 1.5, phase_nr)
+    h_nr = TimeSeries(np.exp(1j * phase_nr), delta_t=_DELTA_T, epoch=t[0])
+    h_sur = TimeSeries(np.exp(1j * phase_sur), delta_t=_DELTA_T, epoch=t[0])
+
+    diff, n_cyc = compute_phase_diff_per_cycle(h_nr, h_sur)
+    assert abs(diff) < 1e-8, "the post-peak disagreement leaked into the inspiral"
+    assert abs(n_cyc - _F0 * _DURATION) < 1.0
+
+    # The superseded whole-span window sees it, which is what made it wrong.
+    whole, _ = compute_phase_diff_per_cycle(h_nr, h_sur, t_stop=None)
+    assert whole > 1e-2

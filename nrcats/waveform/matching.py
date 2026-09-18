@@ -633,14 +633,25 @@ MIN_CYCLES_FOR_PHASE = 3.0
 # compute_phase_diff_per_cycle.
 MIN_PHASE_MONOTONICITY = 0.9
 
+# The phase of a sample is only defined where the waveform carries signal.
+# Samples below this fraction of each series' own peak amplitude are trimmed
+# from both ends of the window before any phase is read.  Without it the window
+# admits leading zero-padding and a post-merger tail decaying into numerical
+# noise -- RIT:eBBH:1133-n100-ecc reaches 9e-26 of its peak before the signal
+# and 1e-13 after it -- whose angle wanders, so a clean 35-cycle chirp read as
+# 0.73 monotone and was refused.  1e-3 is the paper's mode-admissibility floor.
+# With the window ending at the (2,2) peak only the leading edge is trimmed.
+PHASE_AMP_FLOOR = 1e-3
+
 
 def compute_phase_diff_per_cycle(
     h_nr,
     h_sur,
     alignment: str = "epoch",
     min_cycles: float = MIN_CYCLES_FOR_PHASE,
+    t_stop: float | None = 0.0,
 ) -> tuple:
-    """Accumulated phase difference per GW cycle over the common window.
+    """Accumulated inspiral phase difference per GW cycle.
 
     Both inputs are the *complex* mode time series (h_lm = h+ - i h×), and both
     must be referenced to a common ``t = 0`` -- the (2,2) amplitude peak for
@@ -649,18 +660,21 @@ def compute_phase_diff_per_cycle(
 
         phase_diff_per_cycle = |ΔΦ_NR - ΔΦ_sur| / N_cycles_NR   [rad / cycle]
 
-    with ``ΔΦ = |φ(t_end) - φ(t_start)|`` the net phase evolved over the window.
-    The numerator is ``δφ(t_end) - δφ(t_start)``, the change in the phase
-    difference across the window, so a constant offset -- a coalescence-phase
-    convention -- cancels.  It is NOT the phase residual after match()-optimal
-    time alignment.
+    with ``ΔΦ = |φ(t_end) - φ(t_start)|`` the net phase evolved over the window,
+    which runs from the start of the common span to ``t_stop`` -- by default
+    the (2,2) peak, so the quantity is an inspiral phase drift.  The numerator
+    is ``δφ(t_end) - δφ(t_start)``, the change in the phase difference across
+    the window, so a constant offset -- a coalescence-phase convention --
+    cancels.  It is NOT the phase residual after match()-optimal time
+    alignment.
 
     What this function got wrong until 2026-09-18
     ---------------------------------------------
     Note first that, since ``N_cycles_NR = ΔΦ_NR / 2π``, the metric is
     identically ``2π |1 - ΔΦ_sur/ΔΦ_NR|``: 2π times the *fractional* difference
     in accumulated phase, unbounded above, and divergent as the denominator
-    goes to zero.  Two things then made the denominator wrong:
+    goes to zero.  Three things then went wrong, two in the denominator and
+    one in the window:
 
     1. ``N_cycles`` was taken from the *net* endpoint difference, which counts
        cycles only while the phase is monotone.  On ``RIT:eBBH:1132-n100-ecc``
@@ -670,7 +684,8 @@ def compute_phase_diff_per_cycle(
        for an accumulated-phase ratio of 46.9.  The cycle count now comes from
        the total variation, which agrees with the net difference exactly for a
        monotone chirp (``SXS:BBH:2348``: 275.13 rad both ways) and differs by a
-       factor of 30 where the phase wanders.
+       factor of 30 where the phase wanders -- which, item 3 found, it did
+       only after merger: the run carries 0.71 cycles before its peak.
     2. The window was cut around each mode's *own* amplitude peak, found by
        :func:`_get_merger_index`, which takes the last prominent peak in order
        to step over junk radiation.  On a burst-like waveform the last
@@ -678,6 +693,17 @@ def compute_phase_diff_per_cycle(
        at t = +0.2373 s where the epoch puts the peak at 0.  The window is now
        the intersection of the two series *in time*, which is mode-independent
        and needs no peak search.
+    3. The window ran to the end of the common span, through merger and
+       ringdown, while the denominator counts cycles that are almost all
+       inspiral.  The numerator was therefore mostly post-merger: on the (2,2)
+       mode, with the window as cut before the amplitude floor, 98% of
+       |ΔΦ_NR - ΔΦ_sur| for SXS:BBH:2348 accrued after t = 0, 72% for
+       MAYA1022, 94% for GT0357, 69% for RIT:BBH:0555-n120-id1.  A quantity
+       described as secular inspiral drift was mostly a ringdown phase
+       difference spread over the inspiral cycles -- SXS:BBH:2348 reads 0.019
+       rad/cycle over the whole span and 0.0004 up to the peak.  The window
+       now stops at ``t_stop = 0``.  Ringdown agreement is what the match
+       measures; this metric is kept for the inspiral.
 
     ``alignment='peak'`` preserves the superseded behaviour, because
     ``compare_alignment_backends.py`` exists to compare these conventions and
@@ -695,6 +721,11 @@ def compute_phase_diff_per_cycle(
     min_cycles : float, optional
         Refuse to report a value below this many cycles in the window
         (default :data:`MIN_CYCLES_FOR_PHASE`).  Pass ``0`` to disable.
+    t_stop : float or None, optional
+        ``'epoch'`` only: end the window here, in seconds on the common time
+        axis (default ``0.0``, the (2,2) peak).  ``None`` runs to the end of
+        the common span, which is the superseded behaviour of item 3 and is
+        kept so the ringdown share can be measured.
 
     Returns
     -------
@@ -717,6 +748,8 @@ def compute_phase_diff_per_cycle(
         dt = float(h_nr.delta_t)
         t_start = max(float(h_nr.start_time), float(h_sur.start_time))
         t_end = min(float(h_nr.end_time), float(h_sur.end_time))
+        if t_stop is not None:
+            t_end = min(t_end, float(t_stop))
         if t_end <= t_start:
             return float("nan"), float("nan")
         start_nr = max(0, int(round((t_start - float(h_nr.start_time)) / dt)))
@@ -749,8 +782,24 @@ def compute_phase_diff_per_cycle(
     if n < 2:
         return float("nan"), float("nan")
 
-    phi_nr = np.unwrap(np.angle(arr_nr[start_nr : start_nr + n]))
-    phi_sur = np.unwrap(np.angle(arr_sur[start_sur : start_sur + n]))
+    seg_nr = arr_nr[start_nr : start_nr + n]
+    seg_sur = arr_sur[start_sur : start_sur + n]
+
+    # Read phase only where both series carry signal: an angle taken from a
+    # zero-amplitude sample is noise, and it enters both the net advance and
+    # the traversed-cycle count.  See PHASE_AMP_FLOOR.
+    amp_nr = np.abs(seg_nr)
+    amp_sur = np.abs(seg_sur)
+    live = np.flatnonzero(
+        (amp_nr >= PHASE_AMP_FLOOR * amp_nr.max())
+        & (amp_sur >= PHASE_AMP_FLOOR * amp_sur.max())
+    )
+    if len(live) < 2:
+        return float("nan"), float("nan")
+    lo, hi = int(live[0]), int(live[-1]) + 1
+
+    phi_nr = np.unwrap(np.angle(seg_nr[lo:hi]))
+    phi_sur = np.unwrap(np.angle(seg_sur[lo:hi]))
 
     delta_phi_nr = abs(phi_nr[-1] - phi_nr[0])
     delta_phi_sur = abs(phi_sur[-1] - phi_sur[0])
@@ -765,10 +814,12 @@ def compute_phase_diff_per_cycle(
     # A net phase advance is only "accumulated phase" while the phase advances.
     # The numerator compares net advances, so where the NR phase wanders the
     # comparison is between two quantities that do not mean the same thing, and
-    # the honest answer is a refusal.  Measured on the (2,2) mode at 16384 Hz:
-    # SXS:BBH:2348 1.000, GT0357 0.988, MAYA1022 0.975 -- clean chirps, all
-    # reported; GT0420 0.647 and RIT:eBBH:1132-n100-ecc 0.032 -- the two
-    # populations that produced the values findings 5y is about, both refused.
+    # the honest answer is a refusal.  Over the whole common span this refused
+    # GT0420 (0.647) and RIT:eBBH:1132-n100-ecc (0.032), but the wandering was
+    # all post-merger: on the window that ends at t = 0 the (2,2) mode reads
+    # 1.000 for SXS:BBH:2348, MAYA1022, GT0357, GT0420, RIT:BBH:0555-n120-id1
+    # and three RIT eBBH runs, eccentric orbits included, at 16384 Hz.  The
+    # guard is kept as a backstop for leading junk radiation and t_stop=None.
     monotonicity = delta_phi_nr / traversed if traversed > 0 else 0.0
     if monotonicity < MIN_PHASE_MONOTONICITY:
         return float("nan"), n_cycles_nr
